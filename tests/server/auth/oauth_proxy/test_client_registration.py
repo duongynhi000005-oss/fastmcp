@@ -591,3 +591,145 @@ class TestUpstreamClientIdFallback:
 
         with pytest.raises(InvalidRedirectUriError):
             client.validate_redirect_uri(None)
+
+
+class TestClientRegistrationTTL:
+    """Tests for configurable DCR client_registration_ttl and renewal on token issuance."""
+
+    async def test_default_client_registration_ttl_is_none(self, oauth_proxy):
+        """By default, client_registration_ttl is None (persistent registration)."""
+        assert oauth_proxy._client_registration_ttl is None
+        spy_put = AsyncMock(wraps=oauth_proxy._client_store.put)
+        oauth_proxy._client_store.put = spy_put
+
+        client_info = OAuthClientInformationFull(
+            client_id="persistent-client",
+            client_secret="secret",
+            redirect_uris=[AnyUrl("http://localhost:12345/callback")],
+        )
+        await oauth_proxy.register_client(client_info)
+
+        spy_put.assert_awaited_once()
+        assert spy_put.await_args.kwargs.get("ttl") is None
+
+    async def test_register_client_uses_configured_ttl(self, oauth_proxy):
+        """When client_registration_ttl is set, register_client stores the record with that TTL."""
+        oauth_proxy._client_registration_ttl = 3600
+        spy_put = AsyncMock(wraps=oauth_proxy._client_store.put)
+        oauth_proxy._client_store.put = spy_put
+
+        client_info = OAuthClientInformationFull(
+            client_id="ttl-client",
+            client_secret="secret",
+            redirect_uris=[AnyUrl("http://localhost:12345/callback")],
+        )
+        await oauth_proxy.register_client(client_info)
+
+        spy_put.assert_awaited_once()
+        assert spy_put.await_args.kwargs.get("key") == "ttl-client"
+        assert spy_put.await_args.kwargs.get("ttl") == 3600
+
+    async def test_token_issuance_renews_client_registration_ttl(self, oauth_proxy):
+        """Token exchange and refresh renew the DCR client registration TTL."""
+        import time
+        from unittest.mock import patch
+
+        from mcp.server.auth.provider import AuthorizationCode
+
+        from fastmcp.server.auth.auth import RefreshToken
+        from fastmcp.server.auth.oauth_proxy.models import ClientCode
+
+        oauth_proxy._client_registration_ttl = 7200
+        oauth_proxy.set_mcp_path("/mcp")
+
+        client_info = OAuthClientInformationFull(
+            client_id="renewable-client",
+            client_secret="secret",
+            redirect_uris=[AnyUrl("http://localhost:12345/callback")],
+        )
+        await oauth_proxy.register_client(client_info)
+
+        spy_put = AsyncMock(wraps=oauth_proxy._client_store.put)
+        oauth_proxy._client_store.put = spy_put
+
+        client_code = ClientCode(
+            code="auth-code-ttl",
+            client_id="renewable-client",
+            redirect_uri="http://localhost:12345/callback",
+            code_challenge="",
+            code_challenge_method="S256",
+            scopes=["read"],
+            idp_tokens={
+                "access_token": "upstream-access",
+                "refresh_token": "upstream-refresh",
+                "expires_in": 3600,
+                "token_type": "Bearer",
+            },
+            expires_at=time.time() + 300,
+            created_at=time.time(),
+        )
+        await oauth_proxy._code_store.put(key=client_code.code, value=client_code)
+
+        auth_code = AuthorizationCode(
+            code="auth-code-ttl",
+            scopes=["read"],
+            expires_at=time.time() + 300,
+            client_id="renewable-client",
+            code_challenge="",
+            redirect_uri=AnyUrl("http://localhost:12345/callback"),
+            redirect_uri_provided_explicitly=True,
+        )
+        token_result = await oauth_proxy.exchange_authorization_code(
+            client=client_info,
+            authorization_code=auth_code,
+        )
+
+        spy_put.assert_awaited_once()
+        assert spy_put.await_args.kwargs.get("key") == "renewable-client"
+        assert spy_put.await_args.kwargs.get("ttl") == 7200
+
+        # Refresh token exchange should also renew the registration TTL
+        spy_put.reset_mock()
+        with patch(
+            "fastmcp.server.auth.oauth_proxy.proxy.AsyncOAuth2Client"
+        ) as MockClient:
+            mock_client = AsyncMock()
+            mock_client.refresh_token = AsyncMock(
+                return_value={
+                    "access_token": "new-upstream-access",
+                    "refresh_token": "new-upstream-refresh",
+                    "expires_in": 3600,
+                    "token_type": "Bearer",
+                }
+            )
+            MockClient.return_value = mock_client
+
+            assert token_result.refresh_token is not None
+            await oauth_proxy.exchange_refresh_token(
+                client_info,
+                RefreshToken(
+                    token=token_result.refresh_token,
+                    client_id="renewable-client",
+                    scopes=["read"],
+                    expires_at=None,
+                ),
+                ["read"],
+            )
+
+        spy_put.assert_awaited_once()
+        assert spy_put.await_args.kwargs.get("key") == "renewable-client"
+        assert spy_put.await_args.kwargs.get("ttl") == 7200
+
+    async def test_renew_skips_synthetic_upstream_and_cimd_clients(self, oauth_proxy):
+        """_renew_client_registration ignores upstream_client_id and CIMD client IDs."""
+        oauth_proxy._client_registration_ttl = 3600
+        spy_put = AsyncMock(wraps=oauth_proxy._client_store.put)
+        oauth_proxy._client_store.put = spy_put
+
+        await oauth_proxy._renew_client_registration("test-client-id")
+        await oauth_proxy._renew_client_registration(
+            "https://example.com/.well-known/oauth-client.json"
+        )
+
+        spy_put.assert_not_awaited()
+

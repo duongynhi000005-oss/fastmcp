@@ -304,6 +304,8 @@ class OIDCProxy(OAuthProxy):
         fastmcp_access_token_expiry_seconds: int | None = None,
         # Token refresh threshold
         token_expiry_threshold_seconds: int = 0,
+        # Dynamic client registration TTL in client_storage
+        client_registration_ttl: int | None = None,
         # CIMD configuration
         enable_cimd: bool = True,
         # Identity assertion (SEP-990 ID-JAG) support
@@ -500,6 +502,7 @@ class OIDCProxy(OAuthProxy):
             "fallback_refresh_token_expiry_seconds": fallback_refresh_token_expiry_seconds,
             "fastmcp_access_token_expiry_seconds": fastmcp_access_token_expiry_seconds,
             "token_expiry_threshold_seconds": token_expiry_threshold_seconds,
+            "client_registration_ttl": client_registration_ttl,
             "enable_cimd": enable_cimd,
             "identity_assertion": identity_assertion,
         }

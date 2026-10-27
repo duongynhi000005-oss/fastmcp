@@ -341,6 +341,8 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
         fastmcp_access_token_expiry_seconds: int | None = None,
         # Token refresh threshold
         token_expiry_threshold_seconds: int = 0,
+        # Dynamic client registration TTL in client_storage
+        client_registration_ttl: int | None = None,
         # CIMD (Client ID Metadata Document) support
         enable_cimd: bool = True,
         # Identity assertion (SEP-990 ID-JAG) support
@@ -561,6 +563,7 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
             fastmcp_access_token_expiry_seconds
         )
         self._token_expiry_threshold_seconds: int = token_expiry_threshold_seconds
+        self._client_registration_ttl: int | None = client_registration_ttl
 
         if jwt_signing_key is None:
             if upstream_client_secret is None:
@@ -1081,6 +1084,7 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
         await self._client_store.put(
             key=client_info.client_id,
             value=proxy_client,
+            ttl=self._client_registration_ttl,
         )
 
         # The SDK's RegistrationHandler serializes this same `client_info` object
@@ -1108,6 +1112,23 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
             client_info.client_id,
             len(proxy_client.redirect_uris) if proxy_client.redirect_uris else 0,
         )
+
+    async def _renew_client_registration(self, client_id: str | None) -> None:
+        """Renew the stored DCR client registration TTL when tokens are issued."""
+        if self._client_registration_ttl is None or not client_id:
+            return
+        if (
+            self._cimd_manager is not None
+            and self._cimd_manager.is_cimd_client_id(client_id)
+        ) or client_id == self._upstream_client_id:
+            return
+        stored_client = await self._client_store.get(key=client_id)
+        if stored_client is not None:
+            await self._client_store.put(
+                key=client_id,
+                value=stored_client,
+                ttl=self._client_registration_ttl,
+            )
 
     # -------------------------------------------------------------------------
     # Authorization Flow (Proxy to Upstream)
@@ -1506,6 +1527,8 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
                 ttl=refresh_expires_in,
             )
 
+        await self._renew_client_registration(client.client_id)
+
         logger.debug(
             "Issued FastMCP tokens for client=%s (access_jti=%s, refresh_jti=%s)",
             client.client_id,
@@ -1631,6 +1654,8 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
                 "assertion_iss": str(claims.get("iss")),
             },
         )
+
+        await self._renew_client_registration(client.client_id)
 
         logger.debug(
             "Issued ID-JAG access token for subject=%s client=%s jti=%s",
@@ -2024,6 +2049,8 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
 
         # Delete old refresh token (by hash)
         await self._refresh_token_store.delete(key=_hash_token(refresh_token.token))
+
+        await self._renew_client_registration(client.client_id)
 
         logger.info(
             "Issued new FastMCP tokens (rotated refresh) for client=%s (access_jti=%s, refresh_jti=%s)",
