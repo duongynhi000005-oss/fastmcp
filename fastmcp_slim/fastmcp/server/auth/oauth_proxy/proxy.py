@@ -1422,30 +1422,6 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
                     refresh_expires_in,
                 )
 
-        # Encrypt and store upstream tokens
-        upstream_token_set = UpstreamTokenSet(
-            upstream_token_id=upstream_token_id,
-            access_token=idp_tokens["access_token"],
-            refresh_token=idp_tokens["refresh_token"]
-            if idp_tokens.get("refresh_token")
-            else None,
-            refresh_token_expires_at=refresh_token_expires_at,
-            expires_at=time.time() + expires_in,
-            token_type=idp_tokens.get("token_type", "Bearer"),
-            scope=" ".join(granted_scopes),
-            client_id=client.client_id or "",
-            created_at=time.time(),
-            raw_token_data=idp_tokens,
-        )
-        await self._upstream_token_store.put(
-            key=upstream_token_id,
-            value=upstream_token_set,
-            ttl=max(
-                refresh_expires_in or 0, expires_in, fastmcp_access_expires_in, 1
-            ),  # Keep until longest-lived token expires (min 1s for safety)
-        )
-        logger.debug("Stored encrypted upstream tokens (jti=%s)", access_jti[:8])
-
         # Extract upstream claims to embed in FastMCP JWT (if subclass implements)
         upstream_claims = await self._extract_upstream_claims(idp_tokens)
 
@@ -1472,6 +1448,37 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
                 upstream_claims=upstream_claims,
             )
 
+        refresh_token_hash = (
+            _hash_token(fastmcp_refresh_token) if fastmcp_refresh_token else None
+        )
+
+        # Encrypt and store upstream tokens
+        upstream_token_set = UpstreamTokenSet(
+            upstream_token_id=upstream_token_id,
+            access_token=idp_tokens["access_token"],
+            refresh_token=idp_tokens["refresh_token"]
+            if idp_tokens.get("refresh_token")
+            else None,
+            refresh_token_expires_at=refresh_token_expires_at,
+            expires_at=time.time() + expires_in,
+            token_type=idp_tokens.get("token_type", "Bearer"),
+            scope=" ".join(granted_scopes),
+            client_id=client.client_id or "",
+            created_at=time.time(),
+            raw_token_data=idp_tokens,
+            active_refresh_token_hash=refresh_token_hash,
+            active_refresh_jti=refresh_jti,
+            active_access_jti=access_jti,
+        )
+        await self._upstream_token_store.put(
+            key=upstream_token_id,
+            value=upstream_token_set,
+            ttl=max(
+                refresh_expires_in or 0, expires_in, fastmcp_access_expires_in, 1
+            ),  # Keep until longest-lived token expires (min 1s for safety)
+        )
+        logger.debug("Stored encrypted upstream tokens (jti=%s)", access_jti[:8])
+
         # Store JTI mappings
         await self._jti_mapping_store.put(
             key=access_jti,
@@ -1494,14 +1501,15 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
             )
 
         # Store refresh token metadata (keyed by hash for security)
-        if fastmcp_refresh_token and refresh_expires_in:
+        if fastmcp_refresh_token and refresh_expires_in and refresh_token_hash:
             await self._refresh_token_store.put(
-                key=_hash_token(fastmcp_refresh_token),
+                key=refresh_token_hash,
                 value=RefreshTokenMetadata(
                     client_id=client.client_id,
                     scopes=granted_scopes,
                     expires_at=int(time.time()) + refresh_expires_in,
                     created_at=time.time(),
+                    upstream_token_id=upstream_token_id,
                 ),
                 ttl=refresh_expires_in,
             )
@@ -1770,6 +1778,28 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
                 metadata.client_id,
             )
             return None
+        if metadata.rotated_at is not None:
+            upstream_token_id = metadata.upstream_token_id
+            if upstream_token_id is None:
+                try:
+                    refresh_payload = self.jwt_issuer.verify_token(
+                        refresh_token, expected_token_use="refresh"
+                    )
+                    jti_mapping = await self._jti_mapping_store.get(
+                        key=refresh_payload["jti"]
+                    )
+                    if jti_mapping is not None:
+                        upstream_token_id = jti_mapping.upstream_token_id
+                except Exception:
+                    pass
+            logger.warning(
+                "Detected reuse of rotated refresh token for client=%s (token_hash=%s); "
+                "revoking token family.",
+                client.client_id,
+                token_hash[:8],
+            )
+            await self._revoke_token_family(upstream_token_id)
+            return None
         return RefreshToken(
             token=refresh_token,
             client_id=metadata.client_id,
@@ -1803,8 +1833,34 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
             logger.debug("FastMCP refresh token validation failed: %s", e)
             raise TokenError("invalid_grant", "Invalid refresh token") from e
 
+        old_refresh_hash = _hash_token(refresh_token.token)
+        old_refresh_metadata = await self._refresh_token_store.get(
+            key=old_refresh_hash
+        )
+
         # Look up upstream token via JTI mapping
         jti_mapping = await self._jti_mapping_store.get(key=refresh_jti)
+        if (jti_mapping is not None and jti_mapping.rotated_at is not None) or (
+            old_refresh_metadata is not None
+            and old_refresh_metadata.rotated_at is not None
+        ):
+            upstream_token_id = (
+                jti_mapping.upstream_token_id
+                if jti_mapping is not None
+                else (
+                    old_refresh_metadata.upstream_token_id
+                    if old_refresh_metadata is not None
+                    else None
+                )
+            )
+            logger.warning(
+                "Detected reuse of rotated refresh token for client=%s (jti=%s); "
+                "revoking token family.",
+                client.client_id,
+                refresh_jti[:8],
+            )
+            await self._revoke_token_family(upstream_token_id)
+            raise TokenError("invalid_grant", "Refresh token has already been used")
         if not jti_mapping:
             logger.error("JTI mapping not found for refresh token: %s", refresh_jti[:8])
             raise TokenError("invalid_grant", "Refresh token mapping not found")
@@ -1942,14 +1998,6 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
         # Guard against past expiry (e.g. existing upstream refresh has already
         # ticked past its recorded expiry). Storage TTL must be > 0.
         refresh_ttl = max(refresh_ttl, 1)
-        await self._upstream_token_store.put(
-            key=upstream_token_set.upstream_token_id,
-            value=upstream_token_set,
-            ttl=max(
-                refresh_ttl, new_expires_in, fastmcp_access_expires_in, 1
-            ),  # Keep until longest-lived token expires (min 1s for safety)
-        )
-
         # Re-extract upstream claims from refreshed token response
         upstream_claims = await self._extract_upstream_claims(
             upstream_token_set.raw_token_data
@@ -1967,17 +2015,6 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
             upstream_claims=upstream_claims,
         )
 
-        # Store new access token JTI mapping
-        await self._jti_mapping_store.put(
-            key=new_access_jti,
-            value=JTIMapping(
-                jti=new_access_jti,
-                upstream_token_id=upstream_token_set.upstream_token_id,
-                created_at=time.time(),
-            ),
-            ttl=fastmcp_access_expires_in,  # Auto-expire with FastMCP access token
-        )
-
         # Issue NEW minimal FastMCP refresh token (rotation for security).
         # Use refresh_ttl so the JWT exp claim matches the storage TTL — otherwise
         # providers that don't rotate the refresh token (e.g. Cognito) would get
@@ -1990,6 +2027,30 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
             jti=new_refresh_jti,
             expires_in=refresh_ttl,
             upstream_claims=upstream_claims,
+        )
+        new_refresh_hash = _hash_token(new_fastmcp_refresh)
+
+        upstream_token_set.active_access_jti = new_access_jti
+        upstream_token_set.active_refresh_jti = new_refresh_jti
+        upstream_token_set.active_refresh_token_hash = new_refresh_hash
+
+        await self._upstream_token_store.put(
+            key=upstream_token_set.upstream_token_id,
+            value=upstream_token_set,
+            ttl=max(
+                refresh_ttl, new_expires_in, fastmcp_access_expires_in, 1
+            ),  # Keep until longest-lived token expires (min 1s for safety)
+        )
+
+        # Store new access token JTI mapping
+        await self._jti_mapping_store.put(
+            key=new_access_jti,
+            value=JTIMapping(
+                jti=new_access_jti,
+                upstream_token_id=upstream_token_set.upstream_token_id,
+                created_at=time.time(),
+            ),
+            ttl=fastmcp_access_expires_in,  # Auto-expire with FastMCP access token
         )
 
         # Store new refresh token JTI mapping with aligned expiry
@@ -2004,26 +2065,55 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
             ttl=refresh_ttl,  # Align with upstream refresh token expiry
         )
 
-        # Invalidate old refresh token (refresh token rotation - enforces one-time use)
-        await self._jti_mapping_store.delete(key=refresh_jti)
+        # Mark old refresh token as rotated so replay attempts can be detected
+        # and trigger token family revocation (OAuth 2.1 section 4.3.1).
+        rotated_at = time.time()
+        await self._jti_mapping_store.put(
+            key=refresh_jti,
+            value=JTIMapping(
+                jti=refresh_jti,
+                upstream_token_id=upstream_token_set.upstream_token_id,
+                created_at=jti_mapping.created_at,
+                rotated_at=rotated_at,
+            ),
+            ttl=refresh_ttl,
+        )
         logger.debug(
-            "Rotated refresh token (old JTI invalidated - one-time use enforced)"
+            "Rotated refresh token (old JTI marked rotated for reuse detection)"
         )
 
         # Store new refresh token metadata (keyed by hash)
         await self._refresh_token_store.put(
-            key=_hash_token(new_fastmcp_refresh),
+            key=new_refresh_hash,
             value=RefreshTokenMetadata(
                 client_id=client.client_id,
                 scopes=refreshed_scopes,
                 expires_at=int(time.time()) + refresh_ttl,
                 created_at=time.time(),
+                upstream_token_id=upstream_token_set.upstream_token_id,
             ),
             ttl=refresh_ttl,
         )
 
-        # Delete old refresh token (by hash)
-        await self._refresh_token_store.delete(key=_hash_token(refresh_token.token))
+        # Mark old refresh token metadata as rotated (keyed by hash)
+        await self._refresh_token_store.put(
+            key=old_refresh_hash,
+            value=RefreshTokenMetadata(
+                client_id=client.client_id,
+                scopes=old_refresh_metadata.scopes
+                if old_refresh_metadata is not None
+                else refreshed_scopes,
+                expires_at=old_refresh_metadata.expires_at
+                if old_refresh_metadata is not None
+                else int(rotated_at) + refresh_ttl,
+                created_at=old_refresh_metadata.created_at
+                if old_refresh_metadata is not None
+                else rotated_at,
+                upstream_token_id=upstream_token_set.upstream_token_id,
+                rotated_at=rotated_at,
+            ),
+            ttl=refresh_ttl,
+        )
 
         logger.info(
             "Issued new FastMCP tokens (rotated refresh) for client=%s (access_jti=%s, refresh_jti=%s)",
@@ -2212,7 +2302,7 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
 
             # 2. Look up upstream token via JTI mapping
             jti_mapping = await self._jti_mapping_store.get(key=jti)
-            if not jti_mapping:
+            if not jti_mapping or jti_mapping.rotated_at is not None:
                 logger.info(
                     "JTI mapping not found (token may have expired): jti=%s...",
                     jti[:16],
@@ -2357,6 +2447,71 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
     # -------------------------------------------------------------------------
     # Token Revocation
     # -------------------------------------------------------------------------
+
+    async def _revoke_upstream_token(self, upstream_token_to_revoke: str) -> None:
+        """Best-effort revoke an upstream token at the upstream revocation endpoint."""
+        if not self._upstream_revocation_endpoint:
+            return
+        try:
+            async with httpx2.AsyncClient(
+                timeout=HTTP_TIMEOUT_SECONDS
+            ) as http_client:
+                revocation_data: dict[str, str] = {
+                    "token": upstream_token_to_revoke
+                }
+                request_kwargs: dict[str, Any] = {"data": revocation_data}
+
+                async with self._upstream_oauth_client() as oauth_client:
+                    if oauth_client.client_secret is not None:
+                        request_kwargs["auth"] = (
+                            self._upstream_client_id,
+                            oauth_client.client_secret,
+                        )
+                    else:
+                        revocation_data["client_id"] = self._upstream_client_id
+
+                await http_client.post(
+                    self._upstream_revocation_endpoint,
+                    **request_kwargs,
+                )
+                logger.debug("Successfully revoked token with upstream server")
+        except Exception as e:
+            logger.warning("Failed to revoke token with upstream server: %s", e)
+
+    async def _revoke_token_family(self, upstream_token_id: str | None) -> None:
+        """Revoke all active tokens belonging to an upstream token family.
+
+        Called when a rotated refresh token is replayed (OAuth 2.1 section 4.3.1).
+        Deletes the upstream token set (which immediately invalidates all access
+        and refresh JTI mappings pointing at it), removes the active refresh and
+        access token records, and best-effort revokes the upstream refresh token.
+        """
+        if not upstream_token_id:
+            return
+
+        upstream_token_set = await self._upstream_token_store.get(
+            key=upstream_token_id
+        )
+        await self._upstream_token_store.delete(key=upstream_token_id)
+
+        if upstream_token_set is None:
+            return
+
+        if upstream_token_set.active_refresh_token_hash:
+            await self._refresh_token_store.delete(
+                key=upstream_token_set.active_refresh_token_hash
+            )
+        if upstream_token_set.active_refresh_jti:
+            await self._jti_mapping_store.delete(
+                key=upstream_token_set.active_refresh_jti
+            )
+        if upstream_token_set.active_access_jti:
+            await self._jti_mapping_store.delete(
+                key=upstream_token_set.active_access_jti
+            )
+
+        if self._upstream_revocation_endpoint and upstream_token_set.refresh_token:
+            await self._revoke_upstream_token(upstream_token_set.refresh_token)
 
     async def revoke_token(self, token: AccessToken | RefreshToken) -> None:
         """Revoke token locally and with upstream server if supported.

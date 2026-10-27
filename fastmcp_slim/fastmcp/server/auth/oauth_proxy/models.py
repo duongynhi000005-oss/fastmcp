@@ -122,6 +122,9 @@ class UpstreamTokenSet(BaseModel):
     client_id: str  # MCP client this is bound to
     created_at: float  # Unix timestamp
     raw_token_data: dict[str, Any] = Field(default_factory=dict)  # Full token response
+    active_refresh_token_hash: str | None = None
+    active_refresh_jti: str | None = None
+    active_access_jti: str | None = None
 
 
 class JTIMapping(BaseModel):
@@ -134,6 +137,7 @@ class JTIMapping(BaseModel):
     jti: str  # JWT ID from FastMCP-issued token
     upstream_token_id: str  # References UpstreamTokenSet
     created_at: float  # Unix timestamp
+    rotated_at: float | None = None  # Unix timestamp when rotated (reuse detection)
 
 
 class RefreshTokenMetadata(BaseModel):
@@ -147,6 +151,8 @@ class RefreshTokenMetadata(BaseModel):
     scopes: list[str]
     expires_at: int | None = None
     created_at: float
+    upstream_token_id: str | None = None
+    rotated_at: float | None = None
 
 
 def _hash_token(token: str) -> str:
